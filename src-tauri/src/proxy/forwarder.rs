@@ -9,7 +9,9 @@ use super::{
     failover_switch::FailoverSwitchManager,
     log_codes::fwd as log_fwd,
     provider_router::ProviderRouter,
-    providers::{get_adapter, AuthInfo, AuthStrategy, ProviderAdapter, ProviderType},
+    providers::{
+        get_adapter, uses_anthropic_protocol, AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
+    },
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
         normalize_thinking_type, rectify_anthropic_request, should_rectify_thinking_signature,
@@ -1144,24 +1146,25 @@ impl RequestForwarder {
             .and_then(|u| u.authority().map(|a| a.to_string()));
 
         // 预计算 anthropic-beta 值（仅 Claude）
-        let anthropic_beta_value = if adapter.name() == "Claude" {
-            const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
-            Some(if let Some(beta) = headers.get("anthropic-beta") {
-                if let Ok(beta_str) = beta.to_str() {
-                    if beta_str.contains(CLAUDE_CODE_BETA) {
-                        beta_str.to_string()
+        let anthropic_beta_value =
+            if adapter.name() == "Claude" && uses_anthropic_protocol(provider) {
+                const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
+                Some(if let Some(beta) = headers.get("anthropic-beta") {
+                    if let Ok(beta_str) = beta.to_str() {
+                        if beta_str.contains(CLAUDE_CODE_BETA) {
+                            beta_str.to_string()
+                        } else {
+                            format!("{CLAUDE_CODE_BETA},{beta_str}")
+                        }
                     } else {
-                        format!("{CLAUDE_CODE_BETA},{beta_str}")
+                        CLAUDE_CODE_BETA.to_string()
                     }
                 } else {
                     CLAUDE_CODE_BETA.to_string()
-                }
+                })
             } else {
-                CLAUDE_CODE_BETA.to_string()
-            })
-        } else {
-            None
-        };
+                None
+            };
 
         // ============================================================
         // 构建有序 HeaderMap — 内联替换，保持客户端原始顺序
@@ -1306,7 +1309,8 @@ impl RequestForwarder {
         }
 
         // anthropic-version：仅在缺失时补充默认值
-        if adapter.name() == "Claude" && !saw_anthropic_version {
+        if adapter.name() == "Claude" && uses_anthropic_protocol(provider) && !saw_anthropic_version
+        {
             ordered_headers.append(
                 "anthropic-version",
                 http::HeaderValue::from_static("2023-06-01"),
@@ -1347,12 +1351,8 @@ impl RequestForwarder {
             self.non_streaming_timeout
         };
 
-        // 解析上游代理 URL（供应商单独代理 > 全局代理 > 无）
-        let proxy_config = provider.meta.as_ref().and_then(|m| m.proxy_config.as_ref());
-        let upstream_proxy_url: Option<String> = proxy_config
-            .filter(|c| c.enabled)
-            .and_then(super::http_client::build_proxy_url_from_config)
-            .or_else(super::http_client::get_current_proxy_url);
+        // 获取全局代理 URL
+        let upstream_proxy_url: Option<String> = super::http_client::get_current_proxy_url();
 
         // SOCKS5 代理不支持 CONNECT 隧道，需要用 reqwest
         let is_socks_proxy = upstream_proxy_url
@@ -1368,7 +1368,7 @@ impl RequestForwarder {
         let response = if is_socks_proxy {
             // SOCKS5 代理：只能走 reqwest（不支持 header case 保留）
             log::debug!("[Forwarder] Using reqwest for SOCKS5 proxy");
-            let client = super::http_client::get_for_provider(proxy_config);
+            let client = super::http_client::get();
             let mut request = client.post(&url);
             if !self.non_streaming_timeout.is_zero() {
                 request = request.timeout(self.non_streaming_timeout);
